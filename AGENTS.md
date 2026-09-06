@@ -70,13 +70,129 @@ skills/                              # Repository-specific skills
 
 ## Project Overview
 
-**Gentleman.Dots** is a dotfiles manager + TUI installer with:
-- Go TUI using Bubbletea framework
-- RPG-style Vim Trainer
-- Multi-platform support (macOS, Linux, Termux)
-- Comprehensive E2E testing
+**Gentleman.Dots** is two things living in one repo:
 
-See [README.md](README.md) for full documentation.
+1. **Dotfiles** — plain config trees (`GentlemanNvim/`, `GentlemanZsh/`, `GentlemanFish/`,
+   `GentlemanNushell/`, `GentlemanTmux/`, `GentlemanZellij/`, `GentlemanGhostty/`,
+   `GentlemanKitty/`, `herdr/`, plus root-level `alacritty.toml`, `.wezterm.lua`,
+   `starship.toml`).
+2. **`installer/`** — a Go + Bubbletea TUI that copies those trees into `~/.config` and
+   installs the tools around them, on macOS, Linux (Debian/Ubuntu, Fedora, Arch) and Termux.
+
+Contributors change `installer/`; users receive the `Gentleman*` directories. See
+[README.md](README.md).
+
+> The installer does **not** embed the configs. `stepCloneRepo` clones `Gentleman.Dots` from
+> GitHub at install time and `stepCleanup` deletes the clone afterwards. A local edit under
+> `GentlemanNvim/` is therefore **not** picked up by a local installer run until it lands on
+> `main`.
+
+## Commands
+
+Go commands run from `installer/`.
+
+| Task | Command |
+|------|---------|
+| Build | `go build -o gentleman-dots ./cmd/gentleman-installer` |
+| All tests | `go test ./...` |
+| Tests the way Linux CI runs them | `go test ./... -skip Golden` |
+| One package | `go test ./internal/tui/trainer/ -v` |
+| One test | `go test ./internal/tui/ -run TestWelcomeScreenGolden -v` |
+| Regenerate golden snapshots | `go test ./internal/tui/ -run Golden -update` |
+| Format | `gofmt -w .` |
+
+Golden files in `internal/tui/testdata/` are **rendered on macOS**. CI runs `-skip Golden` on
+Linux and the full suite only on `macos-latest`, so regenerate them on a Mac or the snapshots
+drift.
+
+Running the installer while developing, without touching your real setup:
+
+```bash
+./gentleman-dots --test      # redirects HOME to a temp dir
+./gentleman-dots --dry-run   # prints what would run, executes nothing
+./gentleman-dots --non-interactive --shell=fish --wm=tmux --nvim --terminal=ghostty
+```
+
+Env vars the code reads: `GENTLEMAN_TEST_MODE`, `GENTLEMAN_DRY_RUN`, `GENTLEMAN_VERBOSE`
+(prints step logs in non-interactive mode).
+
+E2E, from `installer/e2e/`:
+
+```bash
+./docker-test.sh              # interactive menu
+./docker-test.sh e2e          # every image
+./docker-test.sh e2e ubuntu   # one of: ubuntu, debian, fedora, alpine, termux
+./docker-test.sh shell alpine # debug shell inside an image
+```
+
+`e2e_test.sh` and `e2e_test_termux.sh` must stay POSIX — Alpine runs them under `ash`,
+Debian under `dash`.
+
+## Architecture
+
+### One Bubbletea model, with an escape hatch
+
+`internal/tui` is a single `Model` (`model.go`) plus a `Screen` enum covering ~30 screens:
+the install flow, the learn/keymaps browsers, backup/restore, and the Vim trainer.
+`update.go` dispatches keys per screen and `view.go` renders per screen — a new screen means
+touching those three files plus `GetCurrentOptions()`.
+
+Installation itself is a **list of `InstallStep` built from `UserChoices`**, and there are
+two builders that must agree:
+
+- `Model.SetupInstallSteps()` (`model.go`) — TUI path; also decides `Interactive` per step.
+- `buildStepsForChoices()` (`non_interactive.go`) — `--non-interactive` path.
+
+Both feed one executor: `executeStep(stepID, *Model)` in `installer.go`, a switch from step
+ID to a `stepXxx` function. **A new step has to be registered in both builders and in that
+switch**, otherwise it silently exists in only one mode.
+
+`Interactive: true` is the escape hatch. Those steps (`homebrew`, `deps`, `terminal`,
+`setshell`) need a real TTY for a sudo password or `chsh`, so rather than running in-process
+they emit a shell script (`interactive.go`) that Bubbletea runs through `tea.ExecProcess`,
+suspending the TUI and handing over the terminal. Anything that prompts the user must go
+this way — `system.Run` has no TTY.
+
+### Progress reporting
+
+Steps execute off the Bubbletea goroutine, so they report through the package-level
+`globalProgram` via `SendLog`, which sends a `stepProgressMsg`. In non-interactive mode the
+same call prints to stdout when `GENTLEMAN_VERBOSE=1`. That global is what lets
+`RunNonInteractive` reuse every step function with a stub `Model`.
+
+### `internal/system` is the only code that touches the OS
+
+`detect.go` produces one `SystemInfo` (OS type, Termux, WSL, presence of brew/xcode/pkg);
+detection order matters — Termux is checked before generic Linux. `exec.go` holds everything
+else: command execution (`Run`, `RunSudo`, `RunBrew`, `RunPkg` and the `*WithLogs` variants),
+file and directory copying, the backup system (`ConfigPaths`, `CreateBackup`, `ListBackups`,
+`RestoreBackup`, into `~/.gentleman-backup-<timestamp>`), and the shell patchers
+(`PatchZshForWM`, `PatchFishForWM`, `PatchNushellForWM`) that inject the multiplexer
+auto-start block while guarding against nested sessions.
+
+### Vim trainer (`internal/tui/trainer`)
+
+Self-contained — no dependency on the TUI package. `types.go` defines `ModuleID` and the
+unlock chain `moduleUnlockOrder`: a module unlocks when the *previous* module's boss is
+defeated. Exercises live one file per module (`exercises_*.go`) and reach the app through
+three dispatchers in `exercises.go`: `GetLessons`, `GetPracticeExercises`, `GetBoss`. A new
+module needs a new `exercises_<name>.go`, an entry in each dispatcher, plus `GetAllModules()`
+and `moduleUnlockOrder`.
+
+`simulator.go` is the core: it executes the user's Vim motions against the exercise buffer to
+compute the resulting cursor position and selection, so answers are graded by **effect**, not
+by string comparison — `validation.go` then grades optimality and accepts alternatives.
+`gamestate.go` holds the session; `stats.go` persists to
+`~/.config/gentleman-trainer/stats.json` (tests override the directory via `statsConfigPath`).
+
+## Conventions
+
+- Step failures are wrapped with `wrapStepError` into a `StepError` carrying step ID, name
+  and a user-facing description — the TUI renders that description, so keep it meaningful.
+- Table-driven tests; `teatest` for whole-program TUI tests.
+- Shell scripts under `installer/e2e/` are POSIX-only and `shellcheck`-clean.
+- `CLAUDE.md`, `GEMINI.md`, `CODEX.md` and `.github/copilot-instructions.md` are **generated
+  from this file and gitignored**. Edit `AGENTS.md`, then run `./skills/setup.sh --all`.
 
 ---
 
